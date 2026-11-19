@@ -1,0 +1,14 @@
+import board, keypad, rotaryio
+
+keys = keypad.Keys((board.GP2, board.GP3, board.GP4, board.GP8),
+                   value_when_pressed=False, pull=True)
+enc = rotaryio.IncrementalEncoder(board.GP6, board.GP7)
+last = enc.position
+
+while True:
+    e = keys.events.get()
+    if e and e.pressed:
+        print('button', e.key_number + 1 if e.key_number < 3 else 'wheel click')
+    if enc.position != last:
+        print('wheel', enc.position)
+        last = enc.position
