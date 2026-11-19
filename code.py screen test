@@ -9,4 +9,4 @@ bus = fourwire.FourWire(spi, command=board.GP20, chip_select=board.GP17,
 display = ILI9341(bus, width=320, height=240)
 group = displayio.Group()
 group.append(label.Label(terminalio.FONT, text='Hello macropad', scale=3, x=20, y=120))
-display.root_group = grou
+display.root_group = group
