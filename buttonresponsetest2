@@ -1,0 +1,17 @@
+import board, digitalio, time
+
+pins = {'GP2': board.GP2, 'GP3': board.GP3, 'GP4': board.GP4,
+        'GP6': board.GP6, 'GP7': board.GP7, 'GP8': board.GP8}
+inputs = {}
+for name, pin in pins.items():
+    p = digitalio.DigitalInOut(pin)
+    p.switch_to_input(pull=digitalio.Pull.UP)
+    inputs[name] = p
+
+last = None
+while True:
+    state = {n: p.value for n, p in inputs.items()}
+    if state != last:
+        print(state)
+        last = state
+    time.sleep(0.02)
