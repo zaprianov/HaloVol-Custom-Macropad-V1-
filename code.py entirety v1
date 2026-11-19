@@ -1,0 +1,206 @@
+import board
+import busio
+import digitalio
+import displayio
+import fourwire
+import keypad
+import neopixel
+import rotaryio
+import terminalio
+import usb_cdc
+import usb_hid
+import vectorio
+from adafruit_display_text import label
+from adafruit_hid.consumer_control import ConsumerControl
+from adafruit_hid.consumer_control_code import ConsumerControlCode as Key
+from adafruit_hid.keyboard import Keyboard
+from adafruit_hid.keycode import Keycode
+from adafruit_ili9341 import ILI9341
+
+# ---- Settings you may tweak ----
+STEPS_PER_CLICK = 4           # try 2 if the knob feels like it skips
+NUM_BARS = 40
+WAVE_CENTER_Y = 170
+WAVE_MAX_HEIGHT = 110
+LED_BRIGHTNESS = 0.25
+LEDS_OFF_WITH_SCREEN = True
+RAZER_VIA_KEYSTROKE = False   # True: button 2 presses Ctrl+Alt+F13 instead of asking the script
+RING_START = 3                # LEDs 0-2 are the buttons, LEDs 3-14 are the wheel ring
+RING_COUNT = 12
+MODE_COLORS = {'volume': 0x00C8FF, 'brightness': 0xFFB000}
+
+# ---- Backlight switch (2N3906: low = on, high = off) ----
+backlight = digitalio.DigitalInOut(board.GP22)
+backlight.direction = digitalio.Direction.OUTPUT
+backlight.value = False
+
+# ---- LEDs ----
+pixels = neopixel.NeoPixel(board.GP10, RING_START + RING_COUNT,
+                           brightness=LED_BRIGHTNESS, auto_write=False)
+
+# ---- Screen ----
+displayio.release_displays()
+spi = busio.SPI(clock=board.GP18, MOSI=board.GP19)
+bus = fourwire.FourWire(spi, command=board.GP20, chip_select=board.GP17,
+                        reset=board.GP21, baudrate=40_000_000)
+display = ILI9341(bus, width=320, height=240)  # if upside down, add rotation=180
+display.auto_refresh = False
+screen = displayio.Group()
+display.root_group = screen
+
+
+def solid(color):
+    p = displayio.Palette(1)
+    p[0] = color
+    return p
+
+
+fill_color = solid(MODE_COLORS['volume'])
+vol_text = label.Label(terminalio.FONT, text='0', scale=5, color=0xFFFFFF, x=12, y=32)
+mode_text = label.Label(terminalio.FONT, text='VOLUME', scale=2,
+                        color=MODE_COLORS['volume'], x=190, y=22)
+mute_text = label.Label(terminalio.FONT, text='', scale=2, color=0xFF4040, x=190, y=48)
+bar_back = vectorio.Rect(pixel_shader=solid(0x303030), x=10, y=72, width=300, height=16)
+bar_fill = vectorio.Rect(pixel_shader=fill_color, x=10, y=72, width=1, height=16)
+for item in (bar_back, bar_fill, vol_text, mode_text, mute_text):
+    screen.append(item)
+
+wave_color = solid(0x00FF9C)
+bars = []
+for i in range(NUM_BARS):
+    r = vectorio.Rect(pixel_shader=wave_color, x=20 + i * 7,
+                      y=WAVE_CENTER_Y - 1, width=5, height=2)
+    bars.append(r)
+    screen.append(r)
+
+# ---- Inputs ----
+cc = ConsumerControl(usb_hid.devices)
+kbd = Keyboard(usb_hid.devices)
+# button 1, button 2, button 3, wheel click
+keys = keypad.Keys((board.GP2, board.GP3, board.GP4, board.GP8),
+                   value_when_pressed=False, pull=True)
+encoder = rotaryio.IncrementalEncoder(board.GP6, board.GP7)
+last_pos = encoder.position
+
+# ---- Link to the computer ----
+data = usb_cdc.data
+data.timeout = 0
+data.write_timeout = 0
+buf = b''
+
+# ---- State ----
+state = {'vol': 0, 'muted': False, 'bright': 0}
+mode = 'volume'     # or 'brightness'
+screen_on = True
+last_drawn = None
+
+
+def send(text):
+    if data.connected:
+        data.write(text.encode())
+
+
+def update_leds(value, color):
+    if not screen_on and LEDS_OFF_WITH_SCREEN:
+        pixels.fill(0)
+    else:
+        pixels[0] = color        # button 1 shows the current mode
+        pixels[1] = 0x44D62C     # button 2
+        pixels[2] = 0xFFFFFF     # button 3
+        lit = (value * RING_COUNT + 99) // 100
+        for i in range(RING_COUNT):
+            pixels[RING_START + i] = color if i < lit else 0x050505
+    pixels.show()
+
+
+def redraw():
+    global last_drawn
+    value = state['vol'] if mode == 'volume' else state['bright']
+    muted = state['muted'] and mode == 'volume'
+    key = (mode, value, muted, screen_on)
+    if key == last_drawn:
+        return
+    last_drawn = key
+    color = MODE_COLORS[mode]
+    vol_text.text = str(value)
+    bar_fill.width = max(1, value * 3)
+    fill_color[0] = color
+    mode_text.text = 'VOLUME' if mode == 'volume' else 'BRIGHTNESS'
+    mode_text.color = color
+    mute_text.text = 'MUTED' if muted else ''
+    update_leds(value, color)
+
+
+def set_screen(on):
+    global screen_on
+    screen_on = on
+    if on:
+        screen.hidden = False
+        display.refresh()
+        backlight.value = False
+    else:
+        backlight.value = True
+        screen.hidden = True
+        display.refresh()
+    redraw()
+
+
+def apply(line):
+    try:
+        parts = line.decode().split(',')
+        state['vol'] = max(0, min(100, int(parts[0])))
+        state['muted'] = parts[1] == '1'
+        state['bright'] = max(0, min(100, int(parts[2])))
+        levels = [int(v) for v in parts[3:3 + NUM_BARS]]
+    except (ValueError, IndexError):
+        return
+    redraw()
+    if screen_on:
+        for i, level in enumerate(levels):
+            h = max(2, min(100, level) * WAVE_MAX_HEIGHT // 100)
+            bars[i].height = h
+            bars[i].y = WAVE_CENTER_Y - h // 2
+        display.refresh()
+
+
+redraw()
+display.refresh()
+
+while True:
+    event = keys.events.get()
+    if event and event.pressed:
+        k = event.key_number
+        if k == 0:                      # button 1: wheel mode
+            mode = 'brightness' if mode == 'volume' else 'volume'
+            redraw()
+            if screen_on:
+                display.refresh()
+        elif k == 1:                    # button 2: Razer lighting
+            if RAZER_VIA_KEYSTROKE:
+                kbd.send(Keycode.CONTROL, Keycode.ALT, Keycode.F13)
+            else:
+                send('RAZER\n')
+        elif k == 2:                    # button 3: screen on/off
+            set_screen(not screen_on)
+        elif k == 3 and mode == 'volume':   # wheel click: mute
+            cc.send(Key.MUTE)
+
+    diff = encoder.position - last_pos
+    clicks = int(diff / STEPS_PER_CLICK)
+    if clicks:
+        last_pos += clicks * STEPS_PER_CLICK
+        if mode == 'volume':
+            for _ in range(abs(clicks)):
+                cc.send(Key.VOLUME_INCREMENT if clicks > 0 else Key.VOLUME_DECREMENT)
+        else:
+            send('BRIGHT,%d\n' % clicks)
+
+    waiting = data.in_waiting
+    if waiting:
+        buf += data.read(waiting)
+        if b'\n' in buf:
+            lines = buf.split(b'\n')
+            buf = lines[-1]
+            apply(lines[-2])
+        elif len(buf) > 2000:
+            buf = b''
