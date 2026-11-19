@@ -1,0 +1,14 @@
+import board, busio, displayio, fourwire, terminalio
+from adafruit_ili9341 import ILI9341
+from adafruit_display_text import label
+
+displayio.release_displays()
+spi = busio.SPI(clock=board.GP18, MOSI=board.GP19)
+bus = fourwire.FourWire(spi, command=board.GP20, chip_select=board.GP17,
+                        reset=board.GP21, baudrate=40_000_000)
+display = ILI9341(bus, width=320, height=240)
+group = displayio.Group()
+group.append(label.Label(terminalio.FONT, text='Hello macropad', scale=3, x=20, y=120))
+display.root_group = group
+while True:
+    pass
