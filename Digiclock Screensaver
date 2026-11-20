@@ -1,0 +1,136 @@
+import time
+
+import numpy as np
+import requests
+import screen_brightness_control as sbc
+import serial
+import soundcard as sc
+from pycaw.pycaw import AudioUtilities
+
+PORT = 'COM5'           # the pad's SECOND serial port (see Device Manager, Ports)
+NUM_BARS = 40
+FPS = 30
+RATE = 44100
+GAIN = 3.0              # raise if the waves look small, lower if they max out
+BRIGHTNESS_STEP = 5     # percent per wheel click (must match code.py)
+
+# Keyboard lighting colors (R, G, B), cycled by button 2. (0, 0, 0) turns the lighting off.
+RAZER_COLORS = [(68, 214, 44), (255, 0, 0), (0, 120, 255),
+                (160, 64, 255), (255, 255, 255), (0, 0, 0)]
+CHROMA_URL = 'http://localhost:54235/razer/chromasdk'
+
+# ---- Volume and brightness ----
+endpoint = AudioUtilities.GetSpeakers().EndpointVolume
+
+
+def get_volume():
+    return round(endpoint.GetMasterVolumeLevelScalar() * 100), int(endpoint.GetMute())
+
+
+def get_brightness():
+    try:
+        return int(sbc.get_brightness()[0])
+    except Exception:
+        return 0
+
+
+def set_brightness(value):
+    try:
+        sbc.set_brightness(value)
+    except Exception:
+        pass
+
+
+# ---- Razer keyboard lighting ----
+chroma_uri = None
+color_index = -1
+
+
+def chroma_start():
+    global chroma_uri
+    try:
+        reply = requests.post(CHROMA_URL, timeout=2, json={
+            'title': 'Macropad', 'description': 'Macropad lighting control',
+            'author': {'name': 'Macropad', 'contact': 'https://example.com'},
+            'device_supported': ['keyboard'], 'category': 'application'})
+        chroma_uri = reply.json()['uri']
+    except Exception:
+        chroma_uri = None
+
+
+def razer_next():
+    global color_index
+    if chroma_uri is None:
+        chroma_start()
+    if chroma_uri is None:
+        print('Razer Chroma not reachable. Is Synapse running?')
+        return
+    color_index = (color_index + 1) % len(RAZER_COLORS)
+    r, g, b = RAZER_COLORS[color_index]
+    if (r, g, b) == (0, 0, 0):
+        body = {'effect': 'CHROMA_NONE'}
+    else:
+        body = {'effect': 'CHROMA_STATIC', 'param': {'color': r | (g << 8) | (b << 16)}}
+    try:
+        requests.put(chroma_uri + '/keyboard', json=body, timeout=2)
+    except Exception:
+        chroma_start()
+
+
+def chroma_heartbeat():
+    try:
+        requests.put(chroma_uri + '/heartbeat', timeout=2)
+    except Exception:
+        pass
+
+
+# ---- Messages from the pad ----
+def handle(message):
+    global brightness
+    if message == 'RAZER':
+        razer_next()
+    elif message.startswith('BRIGHT,'):
+        try:
+            step = int(message.split(',')[1]) * BRIGHTNESS_STEP
+        except ValueError:
+            return
+        brightness = max(0, min(100, brightness + step))
+        set_brightness(brightness)
+
+
+# ---- Main loop ----
+mic = sc.get_microphone(id=str(sc.default_speaker().name), include_loopback=True)
+ser = serial.Serial(PORT, 115200, timeout=0.05)
+frames = RATE // FPS
+history = [0] * NUM_BARS
+volume, muted = get_volume()
+brightness = get_brightness()
+last_volume_poll = last_brightness_poll = last_beat = time.time()
+
+with mic.recorder(samplerate=RATE) as rec:
+    while True:
+        audio = rec.record(numframes=frames)
+        rms = float(np.sqrt(np.mean(audio ** 2)))
+        level = int(min(1.0, rms * GAIN) ** 0.6 * 100)
+        history.append(level)
+        history.pop(0)
+
+        now = time.time()
+        if now - last_volume_poll > 0.25:
+            volume, muted = get_volume()
+            last_volume_poll = now
+        if now - last_brightness_poll > 3:
+            brightness = get_brightness()
+            last_brightness_poll = now
+        if chroma_uri and now - last_beat > 5:
+            chroma_heartbeat()
+            last_beat = now
+
+        while ser.in_waiting:
+            handle(ser.readline().decode(errors='ignore').strip())
+
+        # line format: volume,muted,brightness,HHMMSS,level,level,...
+        line = '{},{},{},{},{}\n'.format(volume, muted, brightness,
+                                         time.strftime('%H%M%S'),
+                                         ','.join(str(v) for v in history))
+        ser.write(line.encode())
