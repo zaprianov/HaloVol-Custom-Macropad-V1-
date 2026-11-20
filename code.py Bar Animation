@@ -1,0 +1,324 @@
+import time
+
+import board
+import busio
+import displayio
+import fourwire
+import keypad
+import neopixel
+import rotaryio
+import terminalio
+import usb_cdc
+import usb_hid
+import vectorio
+from adafruit_display_text import label
+from adafruit_hid.consumer_control import ConsumerControl
+from adafruit_hid.consumer_control_code import ConsumerControlCode as Key
+from adafruit_hid.keyboard import Keyboard
+from adafruit_hid.keycode import Keycode
+from adafruit_ili9341 import ILI9341
+
+# ============================================================
+#  SETTINGS - change these to customize the pad
+# ============================================================
+# Behavior
+STEPS_PER_CLICK = 4          # try 2 if the knob feels like it skips
+VOLUME_STEP = 2              # volume % the pad's number moves per click
+BRIGHTNESS_STEP = 5          # must match BRIGHTNESS_STEP in macropad_feed.py
+SCREENSAVER_AFTER = 60       # seconds idle before the clock appears (0 = never)
+USE_24_HOUR = False          # False = 12-hour clock with AM/PM
+LEDS_OFF_IN_SCREENSAVER = True
+RAZER_VIA_KEYSTROKE = False  # True: button 2 presses Ctrl+Alt+F13 instead of asking the script
+
+# Colors (0xRRGGBB)
+BACKGROUND = 0x000000
+TEXT_COLOR = 0xFFFFFF
+VOLUME_COLOR = 0x00C8FF
+BRIGHTNESS_COLOR = 0xFFB000
+MUTE_COLOR = 0xFF4040
+BAR_TRACK_COLOR = 0x303030
+WAVE_COLOR = 0x00FF9C
+CLOCK_COLOR = 0xFFFFFF
+
+# Sizes and layout (the screen is 320 x 240 pixels)
+NUMBER_SCALE = 5
+MODE_SCALE = 2
+CLOCK_SCALE = 8
+AMPM_SCALE = 3
+NUM_BARS = 40
+BAR_WIDTH = 5
+BAR_SPACING = 7
+WAVE_CENTER_Y = 170
+WAVE_MAX_HEIGHT = 110
+
+# LEDs (only used if you add them later)
+LED_BRIGHTNESS = 0.25
+RING_START = 3               # LEDs 0-2 are the buttons, the rest are the wheel ring
+RING_COUNT = 12
+
+HOLD_SECONDS = 0.5           # ignore the computer's numbers briefly after you turn the knob
+# ============================================================
+
+MODE_COLORS = {'volume': VOLUME_COLOR, 'brightness': BRIGHTNESS_COLOR}
+
+# ---- LEDs ----
+pixels = neopixel.NeoPixel(board.GP10, RING_START + RING_COUNT,
+                           brightness=LED_BRIGHTNESS, auto_write=False)
+
+# ---- Screen ----
+displayio.release_displays()
+spi = busio.SPI(clock=board.GP18, MOSI=board.GP19)
+bus = fourwire.FourWire(spi, command=board.GP20, chip_select=board.GP17,
+                        reset=board.GP21, baudrate=40_000_000)
+display = ILI9341(bus, width=320, height=240)  # if upside down, add rotation=180
+display.auto_refresh = False
+root = displayio.Group()
+display.root_group = root
+
+
+def solid(color):
+    p = displayio.Palette(1)
+    p[0] = color
+    return p
+
+
+root.append(vectorio.Rectangle(pixel_shader=solid(BACKGROUND),
+                               x=0, y=0, width=320, height=240))
+ui = displayio.Group()       # volume screen
+saver = displayio.Group()    # clock screensaver
+saver.hidden = True
+root.append(ui)
+root.append(saver)
+
+# Volume screen
+fill_color = solid(VOLUME_COLOR)
+vol_text = label.Label(terminalio.FONT, text='0', scale=NUMBER_SCALE,
+                       color=TEXT_COLOR, x=12, y=32)
+mode_text = label.Label(terminalio.FONT, text='VOLUME', scale=MODE_SCALE,
+                        color=VOLUME_COLOR, x=190, y=22)
+mute_text = label.Label(terminalio.FONT, text='', scale=MODE_SCALE,
+                        color=MUTE_COLOR, x=190, y=48)
+bar_back = vectorio.Rectangle(pixel_shader=solid(BAR_TRACK_COLOR),
+                              x=10, y=72, width=300, height=16)
+bar_fill = vectorio.Rectangle(pixel_shader=fill_color,
+                              x=10, y=72, width=1, height=16)
+for item in (bar_back, bar_fill, vol_text, mode_text, mute_text):
+    ui.append(item)
+
+wave_color = solid(WAVE_COLOR)
+bars = []
+for i in range(NUM_BARS):
+    r = vectorio.Rectangle(pixel_shader=wave_color, x=20 + i * BAR_SPACING,
+                           y=WAVE_CENTER_Y - 1, width=BAR_WIDTH, height=2)
+    bars.append(r)
+    ui.append(r)
+
+# Clock screensaver
+clock_text = label.Label(terminalio.FONT, text='--:--', scale=CLOCK_SCALE,
+                         color=CLOCK_COLOR, x=40, y=105)
+ampm_text = label.Label(terminalio.FONT, text='', scale=AMPM_SCALE,
+                        color=CLOCK_COLOR, x=140, y=185)
+saver.append(clock_text)
+saver.append(ampm_text)
+
+# ---- Inputs ----
+cc = ConsumerControl(usb_hid.devices)
+kbd = Keyboard(usb_hid.devices)
+# button 1, button 2, button 3, wheel click
+keys = keypad.Keys((board.GP2, board.GP3, board.GP4, board.GP8),
+                   value_when_pressed=False, pull=True)
+encoder = rotaryio.IncrementalEncoder(board.GP6, board.GP7)
+last_pos = encoder.position
+
+# ---- Link to the computer ----
+data = usb_cdc.data
+data.timeout = 0
+data.write_timeout = 0
+buf = b''
+
+# ---- State ----
+state = {'vol': 0, 'muted': False, 'bright': 0}
+mode = 'volume'              # or 'brightness'
+screensaver = False
+last_drawn = None
+last_activity = time.monotonic()
+hold_until = 0
+clock_base = None            # (seconds since midnight, time.monotonic() when received)
+last_clock = None
+last_clock_check = 0
+
+
+def send(text):
+    if data.connected:
+        data.write(text.encode())
+
+
+def update_leds(value, color):
+    if screensaver and LEDS_OFF_IN_SCREENSAVER:
+        pixels.fill(0)
+    else:
+        pixels[0] = color        # button 1 shows the current mode
+        pixels[1] = 0x44D62C     # button 2
+        pixels[2] = 0xFFFFFF     # button 3
+        lit = (value * RING_COUNT + 99) // 100
+        for i in range(RING_COUNT):
+            pixels[RING_START + i] = color if i < lit else 0x050505
+    pixels.show()
+
+
+def redraw():
+    global last_drawn
+    value = state['vol'] if mode == 'volume' else state['bright']
+    muted = state['muted'] and mode == 'volume'
+    key = (mode, value, muted, screensaver)
+    if key == last_drawn:
+        return
+    last_drawn = key
+    color = MODE_COLORS[mode]
+    vol_text.text = str(value)
+    bar_fill.width = max(1, value * 3)
+    fill_color[0] = color
+    mode_text.text = 'VOLUME' if mode == 'volume' else 'BRIGHTNESS'
+    mode_text.color = color
+    mute_text.text = 'MUTED' if muted else ''
+    update_leds(value, color)
+
+
+def now_seconds():
+    if clock_base is None:
+        return None
+    seconds, received = clock_base
+    return (seconds + int(time.monotonic() - received)) % 86400
+
+
+def update_clock():
+    global last_clock
+    sec = now_seconds()
+    if sec is None:
+        text, suffix = '--:--', ''
+    else:
+        h = sec // 3600
+        m = (sec % 3600) // 60
+        if USE_24_HOUR:
+            text, suffix = '{:02d}:{:02d}'.format(h, m), ''
+        else:
+            text = '{}:{:02d}'.format(h % 12 or 12, m)
+            suffix = 'AM' if h < 12 else 'PM'
+    if (text, suffix) == last_clock:
+        return False
+    last_clock = (text, suffix)
+    clock_text.text = text
+    clock_text.x = (320 - len(text) * 6 * CLOCK_SCALE) // 2
+    ampm_text.text = suffix
+    ampm_text.x = (320 - len(suffix) * 6 * AMPM_SCALE) // 2
+    return True
+
+
+def set_screensaver(on):
+    global screensaver, last_clock
+    screensaver = on
+    ui.hidden = on
+    saver.hidden = not on
+    if on:
+        last_clock = None
+        update_clock()
+    redraw()
+    display.refresh()
+
+
+def wake():
+    global last_activity
+    last_activity = time.monotonic()
+    if screensaver:
+        set_screensaver(False)
+
+
+def apply(line):
+    global clock_base
+    try:
+        parts = line.decode().split(',')
+        vol = max(0, min(100, int(parts[0])))
+        muted = parts[1] == '1'
+        bright = max(0, min(100, int(parts[2])))
+        stamp = parts[3]
+        secs = int(stamp[0:2]) * 3600 + int(stamp[2:4]) * 60 + int(stamp[4:6])
+        levels = [int(v) for v in parts[4:4 + NUM_BARS]]
+    except (ValueError, IndexError):
+        return
+    clock_base = (secs, time.monotonic())
+    if time.monotonic() >= hold_until:
+        state['vol'] = vol
+        state['muted'] = muted
+        state['bright'] = bright
+    redraw()
+    if not screensaver:
+        for i, level in enumerate(levels):
+            h = max(2, min(100, level) * WAVE_MAX_HEIGHT // 100)
+            bars[i].height = h
+            bars[i].y = WAVE_CENTER_Y - h // 2
+        display.refresh()
+
+
+redraw()
+display.refresh()
+
+while True:
+    now = time.monotonic()
+
+    event = keys.events.get()
+    if event and event.pressed:
+        k = event.key_number
+        if k == 2:                          # button 3: screensaver on/off
+            set_screensaver(not screensaver)
+            last_activity = now
+        else:
+            wake()
+            if k == 0:                      # button 1: wheel mode
+                mode = 'brightness' if mode == 'volume' else 'volume'
+                redraw()
+                display.refresh()
+            elif k == 1:                    # button 2: Razer lighting
+                if RAZER_VIA_KEYSTROKE:
+                    kbd.send(Keycode.CONTROL, Keycode.ALT, Keycode.F13)
+                else:
+                    send('RAZER\n')
+            elif k == 3 and mode == 'volume':   # wheel click: mute
+                cc.send(Key.MUTE)
+                state['muted'] = not state['muted']
+                hold_until = now + HOLD_SECONDS
+                redraw()
+                display.refresh()
+
+    diff = encoder.position - last_pos
+    clicks = int(diff / STEPS_PER_CLICK)
+    if clicks:
+        last_pos += clicks * STEPS_PER_CLICK
+        wake()
+        if mode == 'volume':
+            for _ in range(abs(clicks)):
+                cc.send(Key.VOLUME_INCREMENT if clicks > 0 else Key.VOLUME_DECREMENT)
+            state['vol'] = max(0, min(100, state['vol'] + clicks * VOLUME_STEP))
+        else:
+            send('BRIGHT,%d\n' % clicks)
+            state['bright'] = max(0, min(100, state['bright'] + clicks * BRIGHTNESS_STEP))
+        hold_until = now + HOLD_SECONDS
+        redraw()
+        display.refresh()
+
+    if SCREENSAVER_AFTER and not screensaver and now - last_activity > SCREENSAVER_AFTER:
+        set_screensaver(True)
+
+    if screensaver and now - last_clock_check > 0.5:
+        last_clock_check = now
+        if update_clock():
+            display.refresh()
+
+    waiting = data.in_waiting
+    if waiting:
+        buf += data.read(waiting)
+        if b'\n' in buf:
+            lines = buf.split(b'\n')
+            buf = lines[-1]
+            apply(lines[-2])
+        elif len(buf) > 2000:
+            buf = b''
